@@ -1,27 +1,36 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/i2c.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
 
-static const char *TAG = "PAJ7620_POLLING";
+static const char *TAG = "PAJ7620_FULL";
 
-// --- I2C 引脚配置 ---
-#define I2C_MASTER_SCL_IO           20      // SCL 引脚
-#define I2C_MASTER_SDA_IO           21      // SDA 引脚
+// --- I2C 配置 ---
+#define I2C_MASTER_SCL_IO           20
+#define I2C_MASTER_SDA_IO           21
 #define I2C_MASTER_NUM              0
 #define I2C_MASTER_FREQ_HZ          400000
+#define I2C_MASTER_TX_BUF_DISABLE   0
+#define I2C_MASTER_RX_BUF_DISABLE   0
 #define PAJ7620_SENSOR_ADDR         0x73
 
-// --- 寄存器地址 ---
+// --- GPIO 中断配置 ---
+#define PAJ7620_INT_PIN             22
+#define GPIO_INPUT_PIN_SEL          (1ULL<<PAJ7620_INT_PIN)
+
+// --- 寄存器定义 ---
 #define PAJ_REG_PART_ID_L           0x00
 #define PAJ_REG_PART_ID_H           0x01
-#define PAJ_REG_GESTURE_RESULT_L    0x43    // 手势结果寄存器
+#define PAJ_REG_GESTURE_RESULT_L    0x43
 #define PAJ_BANK_SELECT             0xEF
 
-// --- PAJ7620 完整初始化数组 (必要) ---
-// 包含增益、积分时间等光学参数校准，缺少这些会导致识别极差
+static SemaphoreHandle_t s_gesture_sem = NULL;
+
+// --- 完整的初始化数组 (来源于官方驱动/常用库) ---
+// 格式: {寄存器地址, 写入值}
 const uint8_t init_array[][2] = {
     {0xEF,0x00},
 	{0x32,0x29},
@@ -245,7 +254,7 @@ const uint8_t init_array[][2] = {
 };
 #define INIT_ARRAY_SIZE (sizeof(init_array) / sizeof(init_array[0]))
 
-// --- I2C 基础读写函数 ---
+// --- 辅助函数 ---
 
 static esp_err_t i2c_write_byte(uint8_t reg_addr, uint8_t data) {
     uint8_t write_buf[2] = {reg_addr, data};
@@ -256,133 +265,88 @@ static esp_err_t i2c_read_byte(uint8_t reg_addr, uint8_t *data) {
     return i2c_master_write_read_device(I2C_MASTER_NUM, PAJ7620_SENSOR_ADDR, &reg_addr, 1, data, 1, 1000 / portTICK_PERIOD_MS);
 }
 
-// --- 传感器初始化 ---
+static void IRAM_ATTR gpio_isr_handler(void* arg) {
+    xSemaphoreGiveFromISR(s_gesture_sem, NULL);
+}
 
-// ... 其他 I2C 定义保持不变 ...
+// --- 初始化逻辑 ---
 
 static esp_err_t paj7620_init(void) {
     uint8_t data = 0;
-    esp_err_t ret = ESP_OK;
 
-    ESP_LOGI(TAG, "Starting PAJ7620 Init Sequence...");
-
-    // --- 步骤 1: 硬件上电等待 ---
-    // 传感器上电后需要几毫秒稳定电压
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    // --- 步骤 2: 唤醒传感器 (关键!) ---
-    // 读取一次 0x00 (Part ID) 可以唤醒处于休眠状态的传感器
-    // 即使这次读取失败也没关系，关键是发送 I2C 信号唤醒它
+    // 1. 唤醒传感器
+    // 写入 0x00 到 Bank Select (0xEF) 来唤醒或重置通信
+    // 某些模块可能需要先进行一次虚拟读取来唤醒
     i2c_read_byte(0x00, &data);
+    vTaskDelay(pdMS_TO_TICKS(10)); // 唤醒后必须等待
 
-    // 唤醒后必须等待至少 10ms，让内部时钟稳定，否则后续写入无效
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    // --- 步骤 3: 确认 ID (确认唤醒成功) ---
-    // 切换到 Bank 0
+    // 2. 检查 ID (Bank 0)
     i2c_write_byte(PAJ_BANK_SELECT, 0x00);
-
-    ret = i2c_read_byte(PAJ_REG_PART_ID_L, &data);
-    if (ret != ESP_OK || data != 0x20) {
-        ESP_LOGE(TAG, "ID Check Failed! Addr: 0x73? Wiring? (Data: 0x%02x)", data);
-        return ESP_FAIL;
-    }
-
+    i2c_read_byte(PAJ_REG_PART_ID_L, &data);
+    if (data != 0x20) return ESP_FAIL;
     i2c_read_byte(PAJ_REG_PART_ID_H, &data);
     if (data != 0x76) return ESP_FAIL;
 
-    ESP_LOGI(TAG, "Hardware Found (ID: 0x7620). Writing Config...");
+    ESP_LOGI(TAG, "PAJ7620 Hardware ID Verified.");
 
-    // --- 步骤 4: 写入初始化数组 (带延时) ---
-    // ESP32 I2C 很快，PAJ7620 DSP 很慢。必须降速写入。
+    // 3. 写入完整的初始化数组
+    // 这个过程会设置 Bank 1 的各种 DSP 参数，然后再切回 Bank 0
     for (int i = 0; i < INIT_ARRAY_SIZE; i++) {
-        ret = i2c_write_byte(init_array[i][0], init_array[i][1]);
+        esp_err_t ret = i2c_write_byte(init_array[i][0], init_array[i][1]);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Write Array Failed at index %d", i);
+            ESP_LOGE(TAG, "Init Failed at index %d", i);
             return ret;
         }
-        // 【关键修复】每写一个字节，微秒级延时，防止 FIFO 溢出
-        esp_rom_delay_us(100);
     }
 
-    // --- 步骤 5: 最终使能 (小心翼翼版) ---
-
-    // 5.1 再次强制切回 Bank 0 (防止数组最后没切回来)
+    // 4. 再次确保切回 Bank 0
     i2c_write_byte(PAJ_BANK_SELECT, 0x00);
-    vTaskDelay(pdMS_TO_TICKS(50)); // 等 Bank 切换稳
 
-    // 5.2 写入使能命令
-    // ret = i2c_write_byte(0x72, 0x01);
-    // if (ret != ESP_OK) {
-    //     ESP_LOGE(TAG, "Write  Failed ");
-    //     return ret;
-    // }
+    // 5. 开启手势使能 (0x72 寄存器写入 0x01)
+    // 这一点在 Init Array 之后非常关键
+    // ESP_ERROR_CHECK(i2c_write_byte(PAJ_BANK_SELECT, 0x00));
+    // ESP_ERROR_CHECK(i2c_write_byte(0x72, 0x01));
 
-    // 5.3 【关键】给 DSP 时间去加载配置并置位 Bit 0
-    // 很多时候失败是因为这里没延时就马上去读状态了
-    // vTaskDelay(pdMS_TO_TICKS(500));
-
-    // --- 步骤 6: 最终状态校验 ---
-
-    // 读取 0x40 System Flag
-    // uint8_t flag = 0;
-    // i2c_read_byte(0x40, &flag);
-    //
-    // ESP_LOGI(TAG, "Final Check Reg 0x40: 0x%02x", flag);
-    //
-    // // 检查 Bit 0 (Init Success)
-    // if ((flag & 0x01) == 0) {
-    //     // 如果还是失败，尝试“软复位”策略（死马当活马医）
-    //     ESP_LOGW(TAG, "Still not initialized. Retrying Enable...");
-    //     i2c_write_byte(0x72, 0x01);
-    //     vTaskDelay(pdMS_TO_TICKS(50));
-    //     i2c_read_byte(0x40, &flag);
-    //     if ((flag & 0x01) == 0) {
-    //         ESP_LOGE(TAG, "Sensor Init Failed completely. (Flag: 0x%02x)", flag);
-    //         return ESP_FAIL;
-    //     }
-    // }
-
-    ESP_LOGI(TAG, "PAJ7620 Init SUCCESS! Ready.");
+    ESP_LOGI(TAG, "PAJ7620 Configured Successfully.");
     return ESP_OK;
 }
 
-// --- 轮询任务 ---
+// --- 任务逻辑 ---
 
-void gesture_polling_task(void *arg) {
-	uint8_t gesture_data = 0;
-	esp_err_t ret;
+static void gesture_task(void *arg) {
+    uint8_t gesture_data = 0;
+    while (1) {
+        // 等待中断触发
+        if (xSemaphoreTake(s_gesture_sem, portMAX_DELAY) == pdTRUE) {
+            // 读取结果 (同时清除中断标志)
+            esp_err_t ret = i2c_read_byte(PAJ_REG_GESTURE_RESULT_L, &gesture_data);
 
-	while (1) {
-		// 读取手势状态寄存器 (0x43)
-		// 如果没有手势，该寄存器为 0x00
-		ret = i2c_read_byte(PAJ_REG_GESTURE_RESULT_L, &gesture_data);
+            if (ret == ESP_OK && gesture_data != 0) {
+                switch (gesture_data) {
+                	case 0x01: ESP_LOGI(TAG, "Up (上)"); break;
+                	case 0x02: ESP_LOGI(TAG, "Down (下)"); break;
+                	case 0x04: ESP_LOGI(TAG, "Left (左)"); break;
+                	case 0x08: ESP_LOGI(TAG, "Right (右)"); break;
+                	case 0x10: ESP_LOGI(TAG, "Forward (前)"); break;
+                	case 0x20: ESP_LOGI(TAG, "Backward (后)"); break;
+                	case 0x40: ESP_LOGI(TAG, "Clockwise (顺时针)"); break;
+                	case 0x80: ESP_LOGI(TAG, "Anti-Clockwise (逆时针)"); break;
+                	default:   ESP_LOGW(TAG, "Unknown: 0x%02x", gesture_data); break;
+                }
+            }
+            // 简单的消抖延时，防止重复触发
+            vTaskDelay(pdMS_TO_TICKS(200));
 
-		if (ret == ESP_OK && gesture_data != 0) {
-			switch (gesture_data) {
-				case 0x01: ESP_LOGI(TAG, "Up (上)"); break;
-				case 0x02: ESP_LOGI(TAG, "Down (下)"); break;
-				case 0x04: ESP_LOGI(TAG, "Left (左)"); break;
-				case 0x08: ESP_LOGI(TAG, "Right (右)"); break;
-				case 0x10: ESP_LOGI(TAG, "Forward (前)"); break;
-				case 0x20: ESP_LOGI(TAG, "Backward (后)"); break;
-				case 0x40: ESP_LOGI(TAG, "Clockwise (顺时针)"); break;
-				case 0x80: ESP_LOGI(TAG, "Anti-Clockwise (逆时针)"); break;
-				default:   ESP_LOGW(TAG, "Unknown: 0x%02x", gesture_data); break;
-			}
-
-			// 检测到手势后，稍作延时避免重复读取同一个动作
-			vTaskDelay(pdMS_TO_TICKS(200));
-		} else {
-			// 如果没有检测到手势，或者读取失败，稍微休息一下
-			// 100ms 是个不错的轮询间隔，太快占用 I2C 总线，太慢会漏掉动作
-			vTaskDelay(pdMS_TO_TICKS(100));
-		}
-	}
+            // 再次读取以确保清除多余的中断状态（如果传感器还在拉低 INT）
+            // 某些情况下 PAJ7620 可能保留 INT 状态直到数据被完全处理
+            // 可选步骤
+            // i2c_read_byte(PAJ_REG_GESTURE_RESULT_L, &gesture_data);
+        }
+    }
 }
 
 void app_main(void) {
-    // 1. 初始化 I2C
+    // 1. I2C 初始化
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
@@ -394,11 +358,25 @@ void app_main(void) {
     i2c_param_config(I2C_MASTER_NUM, &conf);
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
 
-    // 2. 初始化传感器
+    s_gesture_sem = xSemaphoreCreateBinary();
+
+    // 2. GPIO 中断初始化
+    const gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = GPIO_INPUT_PIN_SEL,
+    	.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PAJ7620_INT_PIN, gpio_isr_handler, NULL);
+
+    // 3. 传感器初始化与任务启动
     if (paj7620_init() == ESP_OK) {
-        // 3. 创建轮询任务
-        xTaskCreate(gesture_polling_task, "gesture_poll", 4096, NULL, 5, NULL);
+        xTaskCreate(gesture_task, "gesture_task", 4096, NULL, 10, NULL);
     } else {
-        ESP_LOGE(TAG, "Sensor init failed. Check wiring!");
+        ESP_LOGE(TAG, "PAJ7620 Init Failed!");
     }
 }
