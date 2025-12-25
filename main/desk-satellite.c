@@ -1,426 +1,304 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/spi_master.h"
-#include "driver/gpio.h"
+#include "driver/i2c.h"
 #include "esp_log.h"
 
-// --- 1. 引脚定义 (基于你的要求) ---
-#define PIN_NUM_CLK  0
-#define PIN_NUM_MOSI 1
-#define PIN_NUM_RST  2
-#define PIN_NUM_DC   3
-#define PIN_NUM_CS   4
-#define PIN_NUM_BCKL 5
+static const char *TAG = "SPEECH_DRIVER";
 
-// --- 2. 屏幕参数 & 颜色定义 ---
-// 0.96寸 ST7735 通常物理分辨率为 80x160，但在驱动中显存是 132x162
-// 横屏模式下，我们需要处理偏移量
-#define LCD_WIDTH  160
-#define LCD_HEIGHT 80
-#define LCD_OFFSET_X 0 // 偏移量取决于具体的屏幕批次，如果画面偏了，调整这个
-#define LCD_OFFSET_Y 23
+/**
+ * ============================================================
+ * 配置部分
+ * ============================================================
+ */
+#define I2C_MASTER_SCL_IO           20      /*!< GPIO number used for I2C master clock */
+#define I2C_MASTER_SDA_IO           21      /*!< GPIO number used for I2C master data */
+#define I2C_MASTER_NUM              0       /*!< I2C master i2c port number */
+#define I2C_MASTER_FREQ_HZ          100000  /*!< I2C master clock frequency */
+#define I2C_MASTER_TX_BUF_DISABLE   0       /*!< I2C master doesn't need buffer */
+#define I2C_MASTER_RX_BUF_DISABLE   0       /*!< I2C master doesn't need buffer */
+#define I2C_MASTER_TIMEOUT_MS       1000
 
-// 颜色定义 (RGB565格式)
-#define COLOR_BLACK     0x0000
-#define COLOR_LIGHT_BLUE 0x4DFF // 淡蓝色 (类似于图中的颜色)
+#define SPEECH_ADDR                 0x30    // 语音识别模块地址
+#define DATA_HEAD                   0xFD
 
-static const char *TAG = "ROBOT_EYE";
-spi_device_handle_t spi;
+// 芯片状态定义
+#define CHIP_STATUS_INIT_SUCCESS    0x4A
+#define CHIP_STATUS_CORRECT_CMD     0x41
+#define CHIP_STATUS_ERROR_CMD       0x45
+#define CHIP_STATUS_BUSY            0x4E
+#define CHIP_STATUS_IDLE            0x4F
 
-// --- 3. SPI 底层传输函数 ---
+// 编码格式
+#define ENCODING_GB2312             0x00
+#define ENCODING_GBK                0x01
+#define ENCODING_BIG5               0x02
+#define ENCODING_UNICODE            0x03
 
-// 发送指令
-void lcd_cmd(const uint8_t cmd) {
-    esp_err_t ret;
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = 8;
-    t.tx_buffer = &cmd;
-    t.user = (void*)0; // D/C 引脚设为 0 (Command)
+// 发音人 ID (对应 Python Reader_Type)
+#define READER_XIAOYAN              3
+#define READER_XUJIU                51
+#define READER_XUDUO                52
+#define READER_XIAOPING             53
+#define READER_DONALDDUCK           54
+#define READER_XUXIAOBAO            55
 
-    gpio_set_level(PIN_NUM_DC, 0);
-    ret = spi_device_polling_transmit(spi, &t);
-    assert(ret == ESP_OK);
-}
+/**
+ * ============================================================
+ * I2C 底层驱动函数
+ * ============================================================
+ */
 
-// 发送数据
-void lcd_data(const uint8_t *data, int len) {
-    if (len == 0) return;
-    esp_err_t ret;
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = 8 * len;
-    t.tx_buffer = data;
-    t.user = (void*)1; // D/C 引脚设为 1 (Data)
+static esp_err_t i2c_master_init(void)
+{
+    int i2c_master_port = I2C_MASTER_NUM;
 
-    gpio_set_level(PIN_NUM_DC, 1);
-    ret = spi_device_polling_transmit(spi, &t);
-    assert(ret == ESP_OK);
-}
-
-// 发送单个字节数据
-void lcd_data_byte(const uint8_t data) {
-    lcd_data(&data, 1);
-}
-
-// --- 4. ST7735 初始化与设置 ---
-
-void lcd_init() {
-    // 硬件复位
-    gpio_set_level(PIN_NUM_RST, 0);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    gpio_set_level(PIN_NUM_RST, 1);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-
-    // 软件复位
-    lcd_cmd(0x01); // SWRESET
-    vTaskDelay(150 / portTICK_PERIOD_MS);
-
-    // 退出睡眠
-    lcd_cmd(0x11); // SLPOUT
-    vTaskDelay(255 / portTICK_PERIOD_MS);
-
-    // 颜色模式: 16-bit (RGB565)
-    lcd_cmd(0x3A); // COLMOD
-    lcd_data_byte(0x05);
-
-    // 显存数据访问控制 (方向设置)
-    // 0xA0 = Y-X 交换 (横屏) + BGR颜色顺序(大部分ST7735是BGR)
-    // 如果颜色红蓝反了，修改这里。如果屏幕倒了，修改这里。
-    lcd_cmd(0x36); // MADCTL
-    lcd_data_byte(0xA8); // MX, MY, MV, RGB 组合，适配横屏
-
-    // 显示反转 (IPS屏幕通常需要开启反转，如果黑色变白色，请注释掉这行)
-    lcd_cmd(0x21); // INVON
-
-    // 打开显示
-    lcd_cmd(0x29); // DISPON
-}
-
-// 设置绘制窗口
-void lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
-    // 加上偏移量
-    x1 += LCD_OFFSET_X; x2 += LCD_OFFSET_X;
-    y1 += LCD_OFFSET_Y; y2 += LCD_OFFSET_Y;
-
-    uint8_t data[4];
-
-    // 列地址设置
-    lcd_cmd(0x2A); // CASET
-    data[0] = x1 >> 8; data[1] = x1 & 0xFF;
-    data[2] = x2 >> 8; data[3] = x2 & 0xFF;
-    lcd_data(data, 4);
-
-    // 行地址设置
-    lcd_cmd(0x2B); // RASET
-    data[0] = y1 >> 8; data[1] = y1 & 0xFF;
-    data[2] = y2 >> 8; data[3] = y2 & 0xFF;
-    lcd_data(data, 4);
-
-    lcd_cmd(0x2C); // RAMWR
-}
-
-// 填充矩形区域
-void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
-    if((x >= LCD_WIDTH) || (y >= LCD_HEIGHT)) return;
-    if((x + w - 1) >= LCD_WIDTH)  w = LCD_WIDTH  - x;
-    if((y + h - 1) >= LCD_HEIGHT) h = LCD_HEIGHT - y;
-
-    lcd_set_window(x, y, x + w - 1, y + h - 1);
-
-    // 创建一行的数据缓冲区来加速SPI传输
-    uint8_t *line_buffer = heap_caps_malloc(w * 2, MALLOC_CAP_DMA);
-    if (!line_buffer) return;
-
-    for (int i = 0; i < w; i++) {
-        line_buffer[i*2] = color >> 8;
-        line_buffer[i*2+1] = color & 0xFF;
-    }
-
-    // 发送 h 次行数据
-    for (int i = 0; i < h; i++) {
-        lcd_data(line_buffer, w * 2);
-    }
-
-    free(line_buffer);
-}
-
-// 绘制单个像素
-void lcd_draw_pixel(int x, int y, uint16_t color) {
-    if ((x < 0) || (x >= LCD_WIDTH) || (y < 0) || (y >= LCD_HEIGHT)) return;
-    lcd_set_window(x, y, x, y);
-    uint8_t data[2] = {color >> 8, color & 0xFF};
-    lcd_data(data, 2);
-}
-
-// --- 5. 图形绘制算法：圆角矩形 ---
-
-// 辅助：绘制圆角部分 (Bresenham算法变种)
-void draw_circle_helper(int16_t x0, int16_t y0, int16_t r, uint8_t cornername, uint16_t color) {
-    int16_t f = 1 - r;
-    int16_t ddF_x = 1;
-    int16_t ddF_y = -2 * r;
-    int16_t x = 0;
-    int16_t y = r;
-
-    while (x < y) {
-        if (f >= 0) {
-            y--;
-            ddF_y += 2;
-            f += ddF_y;
-        }
-        x++;
-        ddF_x += 2;
-        f += ddF_x;
-
-        if (cornername & 0x1) { // 右下角
-            lcd_draw_pixel(x0 + x, y0 + y, color);
-            lcd_draw_pixel(x0 + y, y0 + x, color);
-        }
-        if (cornername & 0x2) { // 右上角
-            lcd_draw_pixel(x0 + x, y0 - y, color);
-            lcd_draw_pixel(x0 + y, y0 - x, color);
-        }
-        if (cornername & 0x4) { // 左下角
-            lcd_draw_pixel(x0 - y, y0 + x, color);
-            lcd_draw_pixel(x0 - x, y0 + y, color);
-        }
-        if (cornername & 0x8) { // 左上角
-            lcd_draw_pixel(x0 - y, y0 - x, color);
-            lcd_draw_pixel(x0 - x, y0 - y, color);
-        }
-    }
-}
-
-// 辅助：填充圆角部分
-void fill_circle_helper(int16_t x0, int16_t y0, int16_t r, uint8_t cornername, int16_t delta, uint16_t color) {
-    int16_t f = 1 - r;
-    int16_t ddF_x = 1;
-    int16_t ddF_y = -2 * r;
-    int16_t x = 0;
-    int16_t y = r;
-
-    while (x < y) {
-        if (f >= 0) {
-            y--;
-            ddF_y += 2;
-            f += ddF_y;
-        }
-        x++;
-        ddF_x += 2;
-        f += ddF_x;
-
-        if (cornername & 0x1) { // Right segments
-            lcd_fill_rect(x0 + x, y0 - y, 1, 2 * y + 1 + delta, color);
-            lcd_fill_rect(x0 + y, y0 - x, 1, 2 * x + 1 + delta, color);
-        }
-        if (cornername & 0x2) { // Left segments
-            lcd_fill_rect(x0 - x, y0 - y, 1, 2 * y + 1 + delta, color);
-            lcd_fill_rect(x0 - y, y0 - x, 1, 2 * x + 1 + delta, color);
-        }
-    }
-}
-
-// 绘制填充的圆角矩形
-void draw_filled_rounded_rect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t color) {
-    // 绘制中间的主矩形
-    lcd_fill_rect(x + r, y, w - 2 * r, h, color);
-
-    // 绘制左边和右边的矩形部分（除了圆角剩下的部分）
-    // 为了简化，这里我们使用 fill_circle_helper 来处理四个角和侧边填充
-    // 但更简单的方法是：绘制三个矩形 + 四个角的圆弧填充
-
-    // 方案B：简单几何拼接
-    // 1. 中间竖条
-    // lcd_fill_rect(x + r, y, w - 2 * r, h, color); // 上面已画
-    // 2. 左侧竖条（不含角）
-    lcd_fill_rect(x, y + r, r, h - 2 * r, color);
-    // 3. 右侧竖条（不含角）
-    lcd_fill_rect(x + w - r, y + r, r, h - 2 * r, color);
-
-    // 4. 填充四个圆角
-    // 左上
-    fill_circle_helper(x + r, y + r, r, 0, 0, color);
-    // 这里 fill_circle_helper 比较通用，我们手动画四个角的扇形填充比较繁琐，
-    // 最简单的 Hack 是画实心圆然后覆盖，但效率低。
-    // 我们用一种简单的逐行扫描圆的方法来补全四个角：
-
-    int16_t f = 1 - r;
-    int16_t ddF_x = 1;
-    int16_t ddF_y = -2 * r;
-    int16_t cx = 0;
-    int16_t cy = r;
-
-    while (cx < cy) {
-        if (f >= 0) {
-            cy--;
-            ddF_y += 2;
-            f += ddF_y;
-        }
-        cx++;
-        ddF_x += 2;
-        f += ddF_x;
-
-        // 绘制四个角的水平线
-        // 左上角
-        lcd_fill_rect(x + r - cy, y + r - cx, cy - cx, 1, color); // 补缝隙
-        lcd_fill_rect(x + r - cx, y + r - cy, cx, 1, color);
-        lcd_draw_pixel(x + r - cy, y + r - cx, color); // 边缘点
-        lcd_draw_pixel(x + r - cx, y + r - cy, color);
-
-        // 右上角
-        lcd_fill_rect(x + w - r + cx, y + r - cy, cy - cx, 1, color);
-        lcd_draw_pixel(x + w - r + cy, y + r - cx, color);
-        // ... 这个算法在嵌入式手写有点复杂，我们用一个更笨但稳定的方法：
-        // 重新定义一个简单的填充圆角函数，利用对称性画水平线
-    }
-}
-
-// 简化的实心圆角矩形绘制函数 (优化的扫描线法)
-void draw_robot_eye(int x, int y, int w, int h, int r, uint16_t color) {
-    // 限制圆角半径
-    if (r > w/2) r = w/2;
-    if (r > h/2) r = h/2;
-
-    // 1. 绘制中间的主体矩形 (高度为 h)
-    lcd_fill_rect(x + r, y, w - 2 * r, h, color);
-
-    // 2. 绘制左右两侧的矩形 (高度为 h - 2r)
-    lcd_fill_rect(x, y + r, r, h - 2 * r, color);
-    lcd_fill_rect(x + w - r, y + r, r, h - 2 * r, color);
-
-    // 3. 填充四个角 (Bresenham)
-    int f = 1 - r;
-    int ddF_x = 1;
-    int ddF_y = -2 * r;
-    int cx = 0;
-    int cy = r;
-
-    while (cx < cy) {
-        if (f >= 0) {
-            cy--;
-            ddF_y += 2;
-            f += ddF_y;
-        }
-        cx++;
-        ddF_x += 2;
-        f += ddF_x;
-
-        // 上方角 (Top)
-        lcd_fill_rect(x + r - cx, y + r - cy, cx, 1, color); // 左上 part 1
-        lcd_fill_rect(x + r - cy, y + r - cx, cy, 1, color); // 左上 part 2
-
-        lcd_fill_rect(x + w - r, y + r - cy, cx, 1, color);  // 右上 part 1
-        lcd_fill_rect(x + w - r, y + r - cx, cy, 1, color);  // 右上 part 2
-
-        // 下方角 (Bottom)
-        lcd_fill_rect(x + r - cx, y + h - r + cy, cx, 1, color); // 左下 part 1
-        lcd_fill_rect(x + r - cy, y + h - r + cx, cy, 1, color); // 左下 part 2
-
-        lcd_fill_rect(x + w - r, y + h - r + cy, cx, 1, color); // 右下 part 1
-        lcd_fill_rect(x + w - r, y + h - r + cx, cy, 1, color); // 右下 part 2
-    }
-}
-
-// --- 6. 主程序 ---
-
-void app_main(void) {
-    esp_err_t ret;
-
-    // 1. 配置 GPIO
-    gpio_reset_pin(PIN_NUM_DC);
-    gpio_set_direction(PIN_NUM_DC, GPIO_MODE_OUTPUT);
-    gpio_reset_pin(PIN_NUM_RST);
-    gpio_set_direction(PIN_NUM_RST, GPIO_MODE_OUTPUT);
-    gpio_reset_pin(PIN_NUM_BCKL);
-    gpio_set_direction(PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
-
-    // 2. 配置 SPI 总线
-    spi_bus_config_t buscfg = {
-        .miso_io_num = -1, // 不使用 MISO
-        .mosi_io_num = PIN_NUM_MOSI,
-        .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2 + 8
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
 
-    // 3. 配置 SPI 设备
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 20 * 1000 * 1000, // 20 MHz
-        .mode = 0,                          // SPI mode 0
-        .spics_io_num = PIN_NUM_CS,         // CS 引脚
-        .queue_size = 7,
+    i2c_param_config(i2c_master_port, &conf);
+    return i2c_driver_install(i2c_master_port, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
+}
+
+/**
+ * ============================================================
+ * 语音模块控制函数
+ * ============================================================
+ */
+
+esp_err_t i2c_send_byte(const uint8_t *data, size_t write_size) {
+    esp_err_t ret = ESP_FAIL;
+    for (int i = 0; i < write_size;i++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        // 发送设备地址（7位地址 + 写标志）
+        i2c_master_write_byte(cmd, (SPEECH_ADDR << 1) | I2C_MASTER_WRITE, true);
+        // ESP_LOGI(TAG, "发送数据 0x%02X 到地址 0x%02X", data[i], SPEECH_ADDR);
+        i2c_master_write_byte(cmd, data[i], false);
+        // 停止信号
+        i2c_master_stop(cmd);
+        // 执行命令
+        ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+
+        if (ret == ESP_OK) {
+            // ESP_LOGI(TAG, "成功发送数据 0x%02X 到地址 0x%02X", data[i], SPEECH_ADDR);
+        } else if (ret == ESP_ERR_TIMEOUT) {
+            ESP_LOGE(TAG, "I2C 超时");
+        } else {
+            ESP_LOGE(TAG, "发送失败: %s", esp_err_to_name(ret));
+        }
+        // 释放命令链接
+        i2c_cmd_link_delete(cmd);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return ret;
+}
+
+esp_err_t i2c_read_byte(uint8_t *data, size_t rx_len) {
+    esp_err_t ret = ESP_FAIL;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    // 发送设备地址（读模式）
+    i2c_master_write_byte(cmd, (SPEECH_ADDR << 1) | I2C_MASTER_READ, true);
+
+    if (rx_len > 1) {
+        // 读取多个字节
+        i2c_master_read(cmd, data, rx_len, I2C_MASTER_ACK);
+    }
+    // 读取最后一个字节，发送NACK表示结束
+    i2c_master_read_byte(cmd, data + rx_len, I2C_MASTER_NACK);
+    // 停止信号
+    i2c_master_stop(cmd);
+    // 执行命令
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+
+    // 释放命令链接
+    i2c_cmd_link_delete(cmd);
+    // vTaskDelay(10 / portTICK_PERIOD_MS);
+    return ret;
+}
+
+// 获取芯片状态
+uint8_t get_chip_status(void)
+{
+    uint8_t cmd[4] = {0xFD, 0x00, 0x01, 0x21}; // AskState 命令
+    esp_err_t err = i2c_send_byte(cmd, sizeof(cmd));
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Write Status Cmd Error");
+        return 0x00;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50)); // Python 中的 time.sleep(0.05)
+
+    uint8_t status = 0;
+    err = i2c_read_byte(&status, 2);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Read Status Error");
+        return 0x00;
+    }
+
+    // printf("ret 0x%02X\n", status);
+    return status;
+}
+
+// 等待芯片空闲
+void wait_for_idle(void)
+{
+    // 简单超时保护，防止死循环
+    int timeout_counter = 0;
+    while (get_chip_status() != CHIP_STATUS_IDLE) {
+        vTaskDelay(pdMS_TO_TICKS(100)); // Python loop sleep 0.1s
+        timeout_counter++;
+        if(timeout_counter > 200) { // 20秒超时
+             ESP_LOGW(TAG, "Wait for idle timeout");
+             break;
+        }
+    }
+}
+
+// 发送数据包核心函数 (对应 Python 的 I2C_WriteBytes + 协议封装)
+// is_command: 1=发送设置命令(编码0x00), 0=发送文本(需指定编码)
+void speech_send_packet(const uint8_t *data, size_t len, uint8_t encoding_format)
+{
+    // 协议结构: [Head, Len_H, Len_L, Cmd, Encoding] + [Data Bytes]
+    // Size = 数据长度 + 2 (协议规定)
+    size_t size = len + 2;
+
+    uint8_t header[5];
+    header[0] = DATA_HEAD;
+    header[1] = (uint8_t)(size >> 8);      // Length HH
+    header[2] = (uint8_t)(size & 0x00FF);  // Length LL
+    header[3] = 0x01;                      // Command
+    header[4] = encoding_format;
+
+    // ESP32 I2C 是一次性写入 buffer，不像 Python 那样 byte-by-byte sleep
+    // 为了稳定性，我们先发头，再发数据，或者拼接后发送。
+    // 这里采用分两次发送，模拟 Python 逻辑
+
+    // 1. 发送帧头
+    i2c_send_byte(header, 5);
+
+    // 2. 发送内容
+    i2c_send_byte(data, len);
+}
+
+// 对应 Python 的 SetBase 和 TextCtrl
+// cmd_char: 例如 'v', 'm'
+// num: 数值, 如果是 -1 则不带数字
+void text_ctrl(char cmd_char, int num)
+{
+    char buf[16];
+    if (num != -1) {
+        printf("0x%02X 0x%02X\n", cmd_char, num);
+        snprintf(buf, sizeof(buf), "[%c%d]", cmd_char, num);
+    } else {
+        printf("0x%02X\n", cmd_char);
+        snprintf(buf, sizeof(buf), "[%c]", cmd_char);
+    }
+    // 控制命令一般使用 GB2312 (0x00) 即可
+    speech_send_packet((uint8_t*)buf, strlen(buf), ENCODING_GB2312);
+
+    // 每个设置指令后等待空闲，根据 Python 逻辑
+    // Python: while GetChipStatus() != ChipStatus_Idle
+    // 注意：有些简单指令可能很快，这里为了保险加上短暂延时，然后轮询
+    vTaskDelay(pdMS_TO_TICKS(2));
+    wait_for_idle();
+}
+
+// 对应 Python: SetReader
+void set_reader(int num) {
+    text_ctrl('m', num);
+}
+
+// 对应 Python: SetVolume
+void set_volume(int volume) {
+    text_ctrl('v', volume);
+}
+
+// 对应 Python: Speech_text
+void speech_text(const uint8_t *text_data, size_t len, uint8_t encoding) {
+    speech_send_packet(text_data, len, encoding);
+}
+
+/**
+ * ============================================================
+ * 主程序逻辑
+ * ============================================================
+ */
+void app_main(void)
+{
+    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_LOGI(TAG, "I2C Initialized on SDA: %d, SCL: %d", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
+
+    // 给一点启动时间
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    ESP_LOGI(TAG, "Setting Reader to READER_XIAOYAN");
+    set_reader(READER_XIAOYAN);
+
+    ESP_LOGI(TAG, "Setting Volume to 10");
+    set_volume(10);
+
+    // "你好亚博智能科技" 的 GB2312 编码
+    // 你好: C4 E3 BA C3
+    // 亚博: D1 C7 B2 A9
+    // 智能: D6 C7 C4 DC
+    // 科技: BF C6 BC BC
+    const uint8_t text1_gb2312[] = {
+        0xC4, 0xE3, 0xBA, 0xC3,
+        0xD1, 0xC7, 0xB2, 0xA9,
+        0xD6, 0xC7, 0xC4, 0xDC,
+        0xBF, 0xC6, 0xBC, 0xBC
     };
 
-    // 初始化 SPI
-    // 注意：ESP32 的 SPI 主机选择 SPI2_HOST 或 SPI3_HOST
-    ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    ESP_ERROR_CHECK(ret);
-    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &spi);
-    ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "Speaking Text 1...");
+    speech_text(text1_gb2312, sizeof(text1_gb2312), ENCODING_GB2312);
 
-    // 4. 初始化屏幕
-    ESP_LOGI(TAG, "Initializing LCD...");
-    lcd_init();
+    // 等待播报结束
+    vTaskDelay(pdMS_TO_TICKS(100));
+    wait_for_idle();
 
-    // 5. 打开背光
-    gpio_set_level(PIN_NUM_BCKL, 1);
+    ESP_LOGI(TAG, "Setting Reader to READER_XIAOYAN");
+    set_reader(READER_XIAOYAN);
 
-    // 6. 绘制内容
-    ESP_LOGI(TAG, "Drawing Robot Eyes...");
+    // "欢迎使用亚博智能语音播报模块" 的 GB2312 编码
+    // 欢迎: BB B6 D3 AD
+    // 使用: CA B9 D3 C3
+    // 亚博: D1 C7 B2 A9
+    // 智能: D6 C7 C4 DC
+    // 语音: D3 EF D2 F4
+    // 播报: B2 A5 B1 A8
+    // 模块: C4 A3 BF E9
+    const uint8_t text2_gb2312[] = {
+        0xBB, 0xB6, 0xD3, 0xAD,
+        0xCA, 0xB9, 0xD3, 0xC3,
+        0xD1, 0xC7, 0xB2, 0xA9,
+        0xD6, 0xC7, 0xC4, 0xDC,
+        0xD3, 0xEF, 0xD2, 0xF4,
+        0xB2, 0xA5, 0xB1, 0xA8,
+        0xC4, 0xA3, 0xBF, 0xE9
+    };
 
-    // 清屏黑色
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, COLOR_BLACK);
+    ESP_LOGI(TAG, "Speaking Text 2...");
+    speech_text(text2_gb2312, sizeof(text2_gb2312), ENCODING_GB2312);
 
-    // 定义眼睛参数 (基于 160x80 分辨率)
-    int eye_width = 45;
-    int eye_height = 40;
-    int eye_radius = 9; // 圆角半径
-    int gap = 10;        // 两眼间距
-    int start_y = (LCD_HEIGHT - eye_height) / 2; // 垂直居中
+    // 等待播报结束
+    vTaskDelay(pdMS_TO_TICKS(100));
+    wait_for_idle();
 
-    // 计算 X 坐标
-    int total_width = (eye_width * 2) + gap;
-    int start_x_left = (LCD_WIDTH - total_width) / 2;
-    int start_x_right = start_x_left + eye_width + gap;
+    ESP_LOGI(TAG, "Done. Looping...");
 
-    // 绘制左眼
-    draw_robot_eye(start_x_left, start_y, eye_width, eye_height, eye_radius, COLOR_LIGHT_BLUE);
-
-    // 绘制右眼
-    draw_robot_eye(start_x_right, start_y, eye_width, eye_height, eye_radius, COLOR_LIGHT_BLUE);
-
-    ESP_LOGI(TAG, "Done.");
-
-    // --- 5. 动画主循环 (修改部分) ---
-    ESP_LOGI(TAG, "Starting blink animation loop...");
+    // 对应 Python 的 while True
     while (1) {
-        // 1. 睁眼持续时间 (随机)
-        // 持续 1 到 5 秒 (1000ms - 5000ms)
-        int open_duration = (rand() % 4000) + 1000;
-        vTaskDelay(open_duration / portTICK_PERIOD_MS);
-
-        // 2. 闭眼：用黑色背景色覆盖眼睛
-        // 左眼闭合
-        lcd_fill_rect(start_x_left, start_y, eye_width, eye_height, COLOR_BLACK);
-        // 右眼闭合
-        lcd_fill_rect(start_x_right, start_y, eye_width, eye_height, COLOR_BLACK);
-
-        ESP_LOGI(TAG, "Eyes closed...");
-
-        // 3. 闭眼持续时间
-        // 持续 50ms - 200ms (快速眨眼)
-        int blink_duration = (rand() % 150) + 50;
-        vTaskDelay(blink_duration / portTICK_PERIOD_MS);
-
-        // 4. 重新睁眼：重新绘制淡蓝色圆角矩形
-        draw_robot_eye(start_x_left, start_y, eye_width, eye_height, eye_radius, COLOR_LIGHT_BLUE);
-        draw_robot_eye(start_x_right, start_y, eye_width, eye_height, eye_radius, COLOR_LIGHT_BLUE);
-
-        ESP_LOGI(TAG, "Eyes opened...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
