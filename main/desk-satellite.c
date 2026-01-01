@@ -246,7 +246,7 @@ void app_main(void)
     set_reader(READER_XIAOYAN);
 
     ESP_LOGI(TAG, "Setting Volume to 10");
-    set_volume(10);
+    set_volume(6);
 
     // "你好亚博智能科技" 的 GB2312 编码
     // 你好: C4 E3 BA C3
@@ -259,16 +259,6 @@ void app_main(void)
         0xD6, 0xC7, 0xC4, 0xDC,
         0xBF, 0xC6, 0xBC, 0xBC
     };
-
-    ESP_LOGI(TAG, "Speaking Text 1...");
-    speech_text(text1_gb2312, sizeof(text1_gb2312), ENCODING_GB2312);
-
-    // 等待播报结束
-    vTaskDelay(pdMS_TO_TICKS(100));
-    wait_for_idle();
-
-    ESP_LOGI(TAG, "Setting Reader to READER_XIAOYAN");
-    set_reader(READER_XIAOYAN);
 
     // "欢迎使用亚博智能语音播报模块" 的 GB2312 编码
     // 欢迎: BB B6 D3 AD
@@ -288,17 +278,24 @@ void app_main(void)
         0xC4, 0xA3, 0xBF, 0xE9
     };
 
-    ESP_LOGI(TAG, "Speaking Text 2...");
-    speech_text(text2_gb2312, sizeof(text2_gb2312), ENCODING_GB2312);
-
-    // 等待播报结束
-    vTaskDelay(pdMS_TO_TICKS(100));
-    wait_for_idle();
-
-    ESP_LOGI(TAG, "Done. Looping...");
-
-    // 对应 Python 的 while True
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        ESP_LOGI(TAG, "Speaking Text 1...");
+        speech_text(text1_gb2312, sizeof(text1_gb2312), ENCODING_GB2312);
+
+        // 等待播报结束
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait_for_idle();
+
+        ESP_LOGI(TAG, "Speaking Text 2...");
+        speech_text(text2_gb2312, sizeof(text2_gb2312), ENCODING_GB2312);
+
+        // 等待播报结束
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait_for_idle();
+
+        ESP_LOGI(TAG, "Done. Looping...");
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
